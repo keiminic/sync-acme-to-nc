@@ -28,5 +28,12 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install --with-deps chromium
+
+EXPORT NC_USER=ccp-id
+EXPORT NC_PASS=ccp-password
+EXPORT NC_2FA_SECRET=ccp-2fa-secret
+EXPORT NC_PRODUCT_ID=Hosting0000
+EXPORT NC_DOMAIN=example.com
+
 python main.py
 ```
