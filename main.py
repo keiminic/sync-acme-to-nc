@@ -329,6 +329,50 @@ async def update_mail_settings(page: Page, settings_url: str, cert_name: str):
     await page.wait_for_load_state("networkidle")
 
 
+async def remove_old_certificates(page: Page, list_url: str, current_cert_name: str, domain: str):
+    logger.info(f"Removing old certificates at: {list_url}")
+    await page.goto(list_url)
+    await page.wait_for_load_state("networkidle")
+
+    prefix = f"acme-{domain}"
+    
+    rows = await page.locator("tr").all()
+    
+    removed_count = 0
+    for row in rows:
+        try:
+            row_text = await row.inner_text()
+            if prefix in row_text and current_cert_name not in row_text:
+                checkbox = row.locator("input[type='checkbox']")
+                if await checkbox.count() > 0:
+                    await checkbox.first.check(force=True)
+                    removed_count += 1
+        except Exception as e:
+            logger.warning(f"Skipping a row due to error: {e}")
+
+    if removed_count > 0:
+        logger.info(f"Found {removed_count} old certificate(s). Clicking Remove...")
+        try:
+            remove_btn = page.locator("#buttonRemove, button:has-text('Remove'), span:has-text('Remove')").first
+            await remove_btn.click()
+
+            yes_btn = page.get_by_role("button", name="Yes").first
+            try:
+                await yes_btn.wait_for(state="visible", timeout=5000)
+                await yes_btn.click()
+            except:
+                yes_fallback = page.locator("button:has-text('Yes'), span:has-text('Yes')").first
+                await yes_fallback.wait_for(state="visible", timeout=5000)
+                await yes_fallback.click()
+
+            await page.wait_for_load_state("networkidle")
+            logger.info("Old certificates removed.")
+        except Exception as e:
+            logger.error(f"Failed to remove certificates: {e}")
+    else:
+        logger.info("No old certificates found to remove.")
+
+
 async def main():
     date_str = datetime.now().strftime("%Y%m%d")
     cert_name = f"acme-{NC_DOMAIN}{date_str}"
@@ -391,6 +435,20 @@ async def main():
                 page,
                 f"https://{MAILHOSTING_ID}.webhosting.systems/smb/mail-settings/edit/id/{MAIL_ID}/domainId/{MAIL_ID}",
                 cert_name
+            )
+
+            # Step 4, remove old certificates
+            await remove_old_certificates(
+                page,
+                f"https://{WEBHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIN_WEB_ID}",
+                cert_name,
+                NC_DOMAIN
+            )
+            await remove_old_certificates(
+                page,
+                f"https://{MAILHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIL_ID}",
+                cert_name,
+                NC_DOMAIN
             )
 
             logger.info("All tasks completed successfully.")
