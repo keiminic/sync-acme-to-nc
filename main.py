@@ -347,44 +347,69 @@ async def update_mail_settings(page: Page, settings_url: str, cert_name: str):
 
 async def remove_old_certificates(page: Page, list_url: str, current_cert_name: str, domain: str):
     logger.info(f"Removing old certificates at: {list_url}")
-    await page.goto(list_url)
+    
+    for attempt in range(3):
+        try:
+            await page.goto(list_url)
+            break
+        except Exception as e:
+            if "ERR_ABORTED" in str(e) and attempt < 2:
+                logger.warning(f"goto aborted, retrying in 2s... ({e})")
+                await page.wait_for_timeout(2000)
+                continue
+            raise
+            
     await page.wait_for_load_state("networkidle")
 
     prefix = f"acme-{domain}"
     
     rows = await page.locator("tr").all()
     
-    removed_count = 0
+    ids_to_delete = []
     for row in rows:
         try:
             row_text = await row.inner_text()
             if prefix in row_text and current_cert_name not in row_text:
                 checkbox = row.locator("input[type='checkbox']")
                 if await checkbox.count() > 0:
-                    await checkbox.first.check(force=True)
-                    removed_count += 1
+                    cert_id = await checkbox.first.get_attribute("value")
+                    if cert_id:
+                        ids_to_delete.append(cert_id)
         except Exception as e:
             logger.warning(f"Skipping a row due to error: {e}")
 
-    if removed_count > 0:
-        logger.info(f"Found {removed_count} old certificate(s). Clicking Remove...")
+    if ids_to_delete:
+        logger.info(f"Found {len(ids_to_delete)} old certificate(s) to remove: {ids_to_delete}")
         try:
-            remove_btn = page.locator("#buttonRemove, button:has-text('Remove'), span:has-text('Remove')").first
-            await remove_btn.click()
-
-            yes_btn = page.get_by_role("button", name="Yes").first
-            try:
-                await yes_btn.wait_for(state="visible", timeout=5000)
-                await yes_btn.click()
-            except:
-                yes_fallback = page.locator("button:has-text('Yes'), span:has-text('Yes')").first
-                await yes_fallback.wait_for(state="visible", timeout=5000)
-                await yes_fallback.click()
-
-            await page.wait_for_load_state("networkidle")
-            logger.info("Old certificates removed.")
+            csrf_token = await page.locator("#form_forgery_protection_token").get_attribute("value")
+            delete_url = list_url.replace("/list/", "/delete/")
+            
+            js_code = """
+            async ([url, token, ids]) => {
+                const formData = new URLSearchParams();
+                ids.forEach((id, index) => {
+                    formData.append(`ids[${index}]`, id);
+                });
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-Forgery-Protection-Token': token,
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: formData.toString()
+                });
+                return { status: response.status, text: await response.text() };
+            }
+            """
+            result = await page.evaluate(js_code, [delete_url, csrf_token, ids_to_delete])
+            logger.info(f"Delete API response status: {result['status']}")
+            if result['status'] == 200:
+                logger.info("Old certificates removed successfully via API.")
+            else:
+                logger.error(f"Failed to remove certificates via API: {result['text']}")
         except Exception as e:
-            logger.error(f"Failed to remove certificates: {e}")
+            logger.error(f"Failed to remove certificates via API: {e}")
     else:
         logger.info("No old certificates found to remove.")
 
