@@ -52,11 +52,27 @@ async def read_file_content(path: str) -> str:
 async def select_pul_dropdown(page: Page, label_text: str, option_text: str):
     logger.info(f"Operating dropdown: '{label_text}', target option: '{option_text}'")
 
-    await page.get_by_label(label_text, exact=True).click()
+    label_loc = page.get_by_label(label_text, exact=True)
+    if await label_loc.count() == 0:
+        logger.info(f"Exact label not found, trying partial match for '{label_text}'")
+        label_loc = page.get_by_label(label_text, exact=False)
 
-    option_locator = page.locator(".pul-menu__base-item-content", has_text=option_text)
+    await label_loc.first.scroll_into_view_if_needed()
+    await label_loc.first.click()
 
-    await option_locator.first.click()
+    # Wait for the dropdown animation to finish
+    await page.wait_for_timeout(1000)
+
+    # Prefer visible option to avoid clicking an option from a previously opened/hidden dropdown
+    visible_option = page.locator(".pul-menu__base-item-content:visible", has_text=option_text)
+    if await visible_option.count() > 0:
+        await visible_option.first.click()
+    else:
+        logger.warning(f"Visible option '{option_text}' not found, falling back to any matching option.")
+        await page.locator(".pul-menu__base-item-content", has_text=option_text).first.click()
+
+    # Wait to allow the component to update its internal state
+    await page.wait_for_timeout(1000)
 
 
 async def handle_login(page: Page):
