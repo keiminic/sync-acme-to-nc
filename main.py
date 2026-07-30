@@ -197,11 +197,11 @@ async def get_web_internal_ids(page: Page):
         """
         () => {
             try {
-                const scripts = Array.from(document.querySelectorAll('body script'));
-                const targetScript = scripts.find(s => s.innerText.includes('Plesk.run') && s.innerText.includes('siteJetBannerProps'));
+                const scripts = Array.from(document.querySelectorAll('script'));
+                const targetScripts = scripts.filter(s => s.innerText.includes('Plesk.run'));
 
-                if (targetScript) {
-                    const raw = targetScript.innerText;
+                for (const s of targetScripts) {
+                    const raw = s.innerText;
                     const startMarker = 'Plesk.run(';
                     const startIndex = raw.indexOf(startMarker);
 
@@ -210,7 +210,13 @@ async def get_web_internal_ids(page: Page):
                         const lastIndex = jsonStr.lastIndexOf('});');
                         if (lastIndex !== -1) {
                             jsonStr = jsonStr.substring(0, lastIndex + 1);
-                            return JSON.parse(jsonStr);
+                            if (jsonStr.includes('domainId')) {
+                                try {
+                                    return JSON.parse(jsonStr);
+                                } catch (err) {
+                                    // ignore parse errors and continue
+                                }
+                            }
                         }
                     }
                 }
