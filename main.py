@@ -110,10 +110,10 @@ async def handle_login(page: Page):
         logger.info("2FA verification successful")
 
 
-async def process_sso_button(context: BrowserContext, page: Page, button_name: str):
+async def process_sso_button(context: BrowserContext, page: Page, button_name: str) -> Page:
     logger.info(f"Clicking {button_name}...")
     try:
-        btn = page.get_by_text(button_name, exact=True)
+        btn = page.get_by_text(button_name, exact=True).first
         if not await btn.is_visible():
             raise Exception(f"Button {button_name} not found.")
 
@@ -123,11 +123,11 @@ async def process_sso_button(context: BrowserContext, page: Page, button_name: s
         raise Exception(f"Failed to {button_name}: {e}")
 
     new_page = await new_page_info.value
-    logger.info("New tab opened, waiting for page navigation away from blank...")
+    logger.info("New tab opened, waiting for page navigation to webhosting.systems...")
 
-    # Wait until page starts navigating to webhosting.systems or away from about:blank
+    # Wait until page starts navigating to webhosting.systems
     try:
-        await new_page.wait_for_url(lambda u: "webhosting.systems" in u or u != "about:blank", timeout=60000)
+        await new_page.wait_for_url(lambda u: "webhosting.systems" in u, timeout=60000)
     except Exception as e:
         logger.warning(f"wait_for_url notice: {e}")
 
@@ -162,8 +162,7 @@ async def process_sso_button(context: BrowserContext, page: Page, button_name: s
         MAILHOSTING_ID = extracted_id
         await get_mail_internal_id(new_page)
 
-    logger.info(f"Closing tab: {button_name}")
-    await new_page.close()
+    return new_page
 
 
 async def trigger_auto_login(context: BrowserContext, page: Page):
@@ -181,8 +180,9 @@ async def trigger_auto_login(context: BrowserContext, page: Page):
 
     await page.wait_for_load_state("networkidle", timeout=60000)
 
-    await process_sso_button(context, page, "Auto-Login WEB")
-    await process_sso_button(context, page, "Auto-Login MAIL")
+    web_page = await process_sso_button(context, page, "Auto-Login WEB")
+    mail_page = await process_sso_button(context, page, "Auto-Login MAIL")
+    return web_page, mail_page
 
 
 async def get_mail_internal_id(page: Page):
@@ -335,18 +335,27 @@ async def upload_certificate(page: Page, target_url: str, cert_name: str, key_da
     logger.info(f"Uploading certificate to: {target_url}")
     await goto_with_retry(page, target_url)
 
-    if "list" in target_url:
-        logger.info("Currently on the list page, clicking the add certificate button...")
-        add_btn = page.get_by_text("Add SSL/TLS Certificate")
-        if await add_btn.is_visible():
-            await add_btn.click()
+    logger.info(f"Landed on: {page.url} (title: '{await page.title()}')")
+
+    if "login" in page.url:
+        raise Exception(f"Plesk session lost: redirected to login page at {page.url}")
+
+    name_input = page.locator('input[name="name"]')
+    add_btn = page.locator("#buttonAddCertificate").or_(page.get_by_role("link", name="Add SSL/TLS Certificate")).or_(page.get_by_text("Add SSL/TLS Certificate"))
+
+    # If name input is not visible but Add Certificate button is present, click it
+    if await name_input.count() == 0 or not await name_input.first.is_visible():
+        if await add_btn.count() > 0 and await add_btn.first.is_visible():
+            logger.info("Currently on certificate list page, clicking 'Add SSL/TLS Certificate' button...")
+            await add_btn.first.click()
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
             except Exception:
                 pass
 
-    logger.info(f"Filling in certificate name: {cert_name}")
-    await page.locator('input[name="name"]').fill(cert_name)
+    logger.info(f"Waiting for certificate name field and filling: {cert_name}")
+    await name_input.first.wait_for(state="visible", timeout=30000)
+    await name_input.first.fill(cert_name)
 
     logger.info("Entering private key...")
     await page.locator('textarea[name="uploadText[privateKeyText]"]').fill(key_data)
@@ -357,10 +366,18 @@ async def upload_certificate(page: Page, target_url: str, cert_name: str, key_da
     logger.info("Submitting certificate...")
     await page.locator("#btn-uploadText-sendText").click()
 
+    # Wait for submission to complete: page redirects back to list or displays success notice
     try:
-        await expect(page.get_by_text("Information: The SSL/TLS certificate was issued.")).to_be_visible(timeout=30000)
-    except:
-        logger.warning("Success message not detected, continuing execution")
+        await page.wait_for_url(lambda u: "list" in u or "ssl-certificate" in u, timeout=30000)
+    except Exception:
+        pass
+
+    try:
+        success_indicator = page.locator(".msg-info, .pul-alert, [class*='alert']").or_(page.locator(f"tr:has-text('{cert_name}')"))
+        await success_indicator.first.wait_for(state="attached", timeout=10000)
+        logger.info("Certificate upload confirmed successfully.")
+    except Exception:
+        logger.warning("Success alert not immediately confirmed, continuing execution")
 
 
 async def secure_mail_action(page: Page, list_url: str, cert_name: str):
@@ -503,54 +520,54 @@ async def main():
         try:
             # Step 1, login and create cookie session for webhosting and mailhosting
             await handle_login(page)
-            await trigger_auto_login(context, page)
+            web_page, mail_page = await trigger_auto_login(context, page)
 
             # Step 2, upload ssl
             await upload_certificate(
-                page,
-                f"https://{WEBHOSTING_ID}.webhosting.systems/smb/ssl-certificate/add/id/{MAIN_WEB_ID}",
+                web_page,
+                f"https://{WEBHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIN_WEB_ID}",
                 cert_name, key_content, cert_content
             )
             await upload_certificate(
-                page,
-                f"https://{MAILHOSTING_ID}.webhosting.systems/smb/ssl-certificate/add/id/{MAIL_ID}",
+                mail_page,
+                f"https://{MAILHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIL_ID}",
                 cert_name, key_content, cert_content
             )
 
             # Step 3, set ssl for root, subdomain and mail
             ## webhosting
             await secure_mail_action(
-                page,
+                web_page,
                 f"https://{WEBHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIN_WEB_ID}",
                 cert_name
             )
             for sub_id in ALL_WEB_IDS:
                 await update_hosting_settings(
-                    page,
+                    web_page,
                     f"https://{WEBHOSTING_ID}.webhosting.systems/smb/web/view/{sub_id}/hosting-settings",
                     cert_name
                 )
             ## mailhosting
             await secure_mail_action(
-                page,
+                mail_page,
                 f"https://{MAILHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIL_ID}",
                 cert_name
             )
             await update_mail_settings(
-                page,
+                mail_page,
                 f"https://{MAILHOSTING_ID}.webhosting.systems/smb/mail-settings/edit/id/{MAIL_ID}/domainId/{MAIL_ID}",
                 cert_name
             )
 
             # Step 4, remove old certificates
             await remove_old_certificates(
-                page,
+                web_page,
                 f"https://{WEBHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIN_WEB_ID}",
                 cert_name,
                 NC_DOMAIN
             )
             await remove_old_certificates(
-                page,
+                mail_page,
                 f"https://{MAILHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIL_ID}",
                 cert_name,
                 NC_DOMAIN
@@ -559,8 +576,13 @@ async def main():
             logger.info("All tasks completed successfully.")
 
         except Exception as e:
-            logger.error(f"Task execution failed: {e}")
-            await page.screenshot(path="error_screenshot.png")
+            logger.error(f"Task execution failed: {e}", exc_info=True)
+            for idx, p_obj in enumerate(context.pages):
+                try:
+                    await p_obj.screenshot(path=f"error_screenshot_{idx}.png")
+                    logger.info(f"Saved screenshot for page {idx}: url={p_obj.url}")
+                except Exception:
+                    pass
             raise
         finally:
             await context.close()
