@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import pyotp
+import re
 import sys
 
 logging.basicConfig(
@@ -75,6 +76,19 @@ async def select_pul_dropdown(page: Page, label_text: str, option_text: str):
     await page.wait_for_timeout(1000)
 
 
+async def goto_with_retry(page: Page, url: str, max_retries: int = 3, timeout: int = 60000):
+    for attempt in range(max_retries):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"goto '{url}' attempt {attempt + 1} failed, retrying in 2s... ({e})")
+                await page.wait_for_timeout(2000)
+                continue
+            raise
+
+
 async def handle_login(page: Page):
     logger.info("Starting login to Netcup CCP...")
     await page.goto(f"{NC_CCP}?login_language=en-US")
@@ -109,12 +123,18 @@ async def process_sso_button(context: BrowserContext, page: Page, button_name: s
         raise Exception(f"Failed to {button_name}: {e}")
 
     new_page = await new_page_info.value
-    logger.info(f"New tab opened, waiting for page load: {new_page.url}")
+    logger.info("New tab opened, waiting for page navigation away from blank...")
+
+    # Wait until page starts navigating to webhosting.systems or away from about:blank
+    try:
+        await new_page.wait_for_url(lambda u: "webhosting.systems" in u or u != "about:blank", timeout=60000)
+    except Exception as e:
+        logger.warning(f"wait_for_url notice: {e}")
 
     try:
-        await new_page.wait_for_load_state("networkidle", timeout=60000)
+        await new_page.wait_for_load_state("domcontentloaded", timeout=60000)
     except Exception as e:
-        raise Exception(f"Page load timed out: {e}")
+        logger.warning(f"Page domcontentloaded notice: {e}")
 
     current_url = new_page.url
     logger.info(f"Captured URL: {current_url}")
@@ -128,7 +148,7 @@ async def process_sso_button(context: BrowserContext, page: Page, button_name: s
             extracted_id = hostname.split('.')[0]
             logger.info(f"Extracted Host ID from URL: {extracted_id}")
         else:
-            logger.error("Could not parse hostname from URL")
+            logger.error(f"Could not parse hostname from URL: {current_url}")
 
     except Exception as e:
         logger.error(f"Failed to extract ID from URL: {e}")
@@ -169,10 +189,31 @@ async def get_mail_internal_id(page: Page):
     target_url = f"https://{MAILHOSTING_ID}.webhosting.systems/smb/mail-settings/list"
     logger.info(f"Navigating to Mail List to find ID for {NC_DOMAIN}: {target_url}")
 
-    await page.goto(target_url)
-    await page.wait_for_load_state("networkidle")
+    # Check if we can switch via UI tab first (much faster and avoids full page reload timeout)
+    mail_settings_tab = page.locator("a[href*='mail-settings']").or_(page.get_by_role("tab", name="Mail Settings"))
+    navigated_via_tab = False
+    if "mail-settings/list" in page.url:
+        navigated_via_tab = True
+    elif await mail_settings_tab.count() > 0 and await mail_settings_tab.first.is_visible():
+        try:
+            logger.info("Clicking 'Mail Settings' tab directly...")
+            await mail_settings_tab.first.click()
+            await page.wait_for_selector("tr", state="attached", timeout=15000)
+            navigated_via_tab = True
+        except Exception as e:
+            logger.warning(f"Clicking Mail Settings tab failed: {e}, falling back to goto")
+
+    if not navigated_via_tab:
+        await goto_with_retry(page, target_url)
+
+    try:
+        await page.wait_for_selector("tr", state="attached", timeout=30000)
+    except Exception as e:
+        logger.warning(f"wait_for_selector 'tr' notice: {e}")
 
     row = page.locator("tr").filter(has_text=NC_DOMAIN)
+    if await row.count() == 0:
+        row = page.locator("tr").filter(has=page.locator(f"a:has-text('{NC_DOMAIN}')"))
 
     if await row.count() == 0:
         logger.error(f"Mail domain '{NC_DOMAIN}' not found in the list.")
@@ -180,10 +221,20 @@ async def get_mail_internal_id(page: Page):
 
     global MAIL_ID
     checkbox = row.locator("input[type='checkbox']")
-    MAIL_ID = await checkbox.get_attribute("value")
+    if await checkbox.count() > 0:
+        MAIL_ID = await checkbox.first.get_attribute("value")
+
+    # Fallback to extracting from domain edit link href: /smb/mail-settings/edit/id/620/domainId/620
+    if not MAIL_ID:
+        domain_link = row.locator("a").filter(has_text=NC_DOMAIN).first
+        if await domain_link.count() > 0:
+            href = await domain_link.get_attribute("href") or ""
+            match = re.search(r'/id/(\d+)', href)
+            if match:
+                MAIL_ID = match.group(1)
 
     if not MAIL_ID:
-        raise Exception("Found mail row but could not extract ID from checkbox value")
+        raise Exception("Found mail row but could not extract ID from checkbox value or link")
 
     logger.info(f"Detected NC_MAIL_ID: {MAIL_ID}")
 
@@ -282,14 +333,17 @@ async def get_web_internal_ids(page: Page):
 
 async def upload_certificate(page: Page, target_url: str, cert_name: str, key_data: str, cert_data: str):
     logger.info(f"Uploading certificate to: {target_url}")
-    await page.goto(target_url)
+    await goto_with_retry(page, target_url)
 
     if "list" in target_url:
         logger.info("Currently on the list page, clicking the add certificate button...")
         add_btn = page.get_by_text("Add SSL/TLS Certificate")
         if await add_btn.is_visible():
             await add_btn.click()
-            await page.wait_for_load_state("networkidle")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception:
+                pass
 
     logger.info(f"Filling in certificate name: {cert_name}")
     await page.locator('input[name="name"]').fill(cert_name)
@@ -311,7 +365,7 @@ async def upload_certificate(page: Page, target_url: str, cert_name: str, key_da
 
 async def secure_mail_action(page: Page, list_url: str, cert_name: str):
     logger.info(f"Executing Secure Mail operation:: {list_url}")
-    await page.goto(list_url)
+    await goto_with_retry(page, list_url)
 
     logger.info(f"Locating certificate row: {cert_name}")
     target_row = page.locator("tr", has_text=cert_name)
@@ -321,12 +375,15 @@ async def secure_mail_action(page: Page, list_url: str, cert_name: str):
     logger.info("Clicking Secure Mail button...")
     await page.locator("#buttonMailCertificate").click()
 
-    await page.wait_for_load_state("networkidle")
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
 
 
 async def update_hosting_settings(page: Page, settings_url: str, cert_name: str):
     logger.info(f"Updating Hosting Settings: {settings_url}")
-    await page.goto(settings_url)
+    await goto_with_retry(page, settings_url)
 
     logger.info(f"Selecting certificate: {cert_name}")
     await select_pul_dropdown(page, "Certificate", cert_name)
@@ -334,12 +391,15 @@ async def update_hosting_settings(page: Page, settings_url: str, cert_name: str)
     logger.info("Saving settings...")
     await page.get_by_role("button", name="Save").click()
 
-    await page.wait_for_load_state("networkidle")
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
 
 
 async def update_mail_settings(page: Page, settings_url: str, cert_name: str):
     logger.info(f"Updating Mail Settings: {settings_url}")
-    await page.goto(settings_url)
+    await goto_with_retry(page, settings_url)
 
     logger.info("Setting Webmail certificate...")
     await select_pul_dropdown(page, "SSL/TLS certificate for webmail", cert_name)
@@ -348,24 +408,20 @@ async def update_mail_settings(page: Page, settings_url: str, cert_name: str):
     await select_pul_dropdown(page, "SSL/TLS certificate for mail", cert_name)
 
     await page.get_by_role("button", name="Save").click()
-    await page.wait_for_load_state("networkidle")
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
 
 
 async def remove_old_certificates(page: Page, list_url: str, current_cert_name: str, domain: str):
     logger.info(f"Removing old certificates at: {list_url}")
-    
-    for attempt in range(3):
-        try:
-            await page.goto(list_url)
-            break
-        except Exception as e:
-            if "ERR_ABORTED" in str(e) and attempt < 2:
-                logger.warning(f"goto aborted, retrying in 2s... ({e})")
-                await page.wait_for_timeout(2000)
-                continue
-            raise
-            
-    await page.wait_for_load_state("networkidle")
+    await goto_with_retry(page, list_url)
+
+    try:
+        await page.wait_for_selector("tr", state="attached", timeout=30000)
+    except Exception as e:
+        logger.warning(f"wait_for_selector 'tr' notice: {e}")
 
     prefix = f"acme-{domain}"
     
@@ -440,6 +496,8 @@ async def main():
             viewport=viewport,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
+        context.set_default_navigation_timeout(60000)
+        context.set_default_timeout(60000)
         page = await context.new_page()
 
         try:
