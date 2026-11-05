@@ -198,43 +198,46 @@ async def get_mail_internal_id(page: Page):
         try:
             logger.info("Clicking 'Mail Settings' tab directly...")
             await mail_settings_tab.first.click()
-            await page.wait_for_selector("tr", state="attached", timeout=15000)
+            await page.wait_for_url("**/smb/mail-settings/list**", timeout=15000)
             navigated_via_tab = True
         except Exception as e:
-            logger.warning(f"Clicking Mail Settings tab failed: {e}, falling back to goto")
+            logger.warning(f"Clicking Mail Settings tab notice: {e}, falling back to goto")
 
     if not navigated_via_tab:
         await goto_with_retry(page, target_url)
 
+    # Wait until the mail settings edit link is present
     try:
-        await page.wait_for_selector("tr", state="attached", timeout=30000)
+        await page.locator("a[href*='mail-settings/edit']").first.wait_for(state="attached", timeout=30000)
     except Exception as e:
-        logger.warning(f"wait_for_selector 'tr' notice: {e}")
+        logger.warning(f"wait_for mail-settings/edit link notice: {e}")
 
-    row = page.locator("tr").filter(has_text=NC_DOMAIN)
-    if await row.count() == 0:
-        row = page.locator("tr").filter(has=page.locator(f"a:has-text('{NC_DOMAIN}')"))
-
-    if await row.count() == 0:
-        logger.error(f"Mail domain '{NC_DOMAIN}' not found in the list.")
-        raise Exception("Mail ID not found")
+    # Locate row for NC_DOMAIN via its mail-settings/edit link
+    domain_link = page.locator("a[href*='mail-settings/edit']").filter(has_text=NC_DOMAIN).first
+    if await domain_link.count() == 0:
+        # Fallback to any tr with NC_DOMAIN
+        row = page.locator("tr").filter(has_text=NC_DOMAIN)
+        if await row.count() == 0:
+            logger.error(f"Mail domain '{NC_DOMAIN}' not found in the list.")
+            raise Exception("Mail ID not found")
+        domain_link = row.locator("a[href*='mail-settings/edit']").first
 
     global MAIL_ID
-    checkbox = row.locator("input[type='checkbox']")
-    if await checkbox.count() > 0:
-        MAIL_ID = await checkbox.first.get_attribute("value")
-
-    # Fallback to extracting from domain edit link href: /smb/mail-settings/edit/id/620/domainId/620
-    if not MAIL_ID:
-        domain_link = row.locator("a").filter(has_text=NC_DOMAIN).first
-        if await domain_link.count() > 0:
-            href = await domain_link.get_attribute("href") or ""
-            match = re.search(r'/id/(\d+)', href)
-            if match:
-                MAIL_ID = match.group(1)
+    # Try extracting domainId from href: /smb/mail-settings/edit/id/620/domainId/620
+    if await domain_link.count() > 0:
+        href = await domain_link.get_attribute("href") or ""
+        match = re.search(r'domainId/(\d+)', href) or re.search(r'/id/(\d+)', href)
+        if match:
+            MAIL_ID = match.group(1)
 
     if not MAIL_ID:
-        raise Exception("Found mail row but could not extract ID from checkbox value or link")
+        row = page.locator("tr").filter(has_text=NC_DOMAIN)
+        checkbox = row.locator("input[type='checkbox']")
+        if await checkbox.count() > 0:
+            MAIL_ID = await checkbox.first.get_attribute("value")
+
+    if not MAIL_ID:
+        raise Exception("Found mail domain link but could not extract domain ID")
 
     logger.info(f"Detected NC_MAIL_ID: {MAIL_ID}")
 
@@ -332,6 +335,10 @@ async def get_web_internal_ids(page: Page):
 
 
 async def upload_certificate(page: Page, target_url: str, cert_name: str, key_data: str, cert_data: str):
+    # Normalize to /add/ url
+    if "/list/" in target_url:
+        target_url = target_url.replace("/list/", "/add/")
+
     logger.info(f"Uploading certificate to: {target_url}")
     await goto_with_retry(page, target_url)
 
@@ -340,19 +347,13 @@ async def upload_certificate(page: Page, target_url: str, cert_name: str, key_da
     if "login" in page.url:
         raise Exception(f"Plesk session lost: redirected to login page at {page.url}")
 
+    # If redirected to /list/, re-navigate directly to /add/
+    if "/list/" in page.url:
+        add_url = page.url.replace("/list/", "/add/")
+        logger.info(f"Page redirected to list, re-navigating directly to add page: {add_url}")
+        await goto_with_retry(page, add_url)
+
     name_input = page.locator('input[name="name"]')
-    add_btn = page.locator("#buttonAddCertificate").or_(page.get_by_role("link", name="Add SSL/TLS Certificate")).or_(page.get_by_text("Add SSL/TLS Certificate"))
-
-    # If name input is not visible but Add Certificate button is present, click it
-    if await name_input.count() == 0 or not await name_input.first.is_visible():
-        if await add_btn.count() > 0 and await add_btn.first.is_visible():
-            logger.info("Currently on certificate list page, clicking 'Add SSL/TLS Certificate' button...")
-            await add_btn.first.click()
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=30000)
-            except Exception:
-                pass
-
     logger.info(f"Waiting for certificate name field and filling: {cert_name}")
     await name_input.first.wait_for(state="visible", timeout=30000)
     await name_input.first.fill(cert_name)
@@ -387,7 +388,7 @@ async def secure_mail_action(page: Page, list_url: str, cert_name: str):
     logger.info(f"Locating certificate row: {cert_name}")
     target_row = page.locator("tr", has_text=cert_name)
 
-    await target_row.locator("input[type='checkbox']").check()
+    await target_row.last.locator("input[type='checkbox']").check()
 
     logger.info("Clicking Secure Mail button...")
     await page.locator("#buttonMailCertificate").click()
@@ -525,12 +526,12 @@ async def main():
             # Step 2, upload ssl
             await upload_certificate(
                 web_page,
-                f"https://{WEBHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIN_WEB_ID}",
+                f"https://{WEBHOSTING_ID}.webhosting.systems/smb/ssl-certificate/add/id/{MAIN_WEB_ID}",
                 cert_name, key_content, cert_content
             )
             await upload_certificate(
                 mail_page,
-                f"https://{MAILHOSTING_ID}.webhosting.systems/smb/ssl-certificate/list/id/{MAIL_ID}",
+                f"https://{MAILHOSTING_ID}.webhosting.systems/smb/ssl-certificate/add/id/{MAIL_ID}",
                 cert_name, key_content, cert_content
             )
 
